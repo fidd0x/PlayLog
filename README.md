@@ -7,6 +7,17 @@ A play-activity log for Nintendo Switch / Switch Lite, in the spirit of the 3DS 
 It reads the console's own play records (the `pdm` service), so your whole history shows up right away,
 including games you've since deleted.
 
+![Games list](screenshots/games.jpg)
+![Activity tab](screenshots/activity.jpg)
+
+## Compatibility
+
+- **Consoles:** Switch, Switch OLED and Switch Lite (tested on a Switch Lite).
+- **Firmware:** any system version supported by current Atmosphère. Play time is read the right way on both
+  older firmware (up to 15.0.1) and 16.0.0 and newer, which changed how the console stores it.
+- **Requires** custom firmware (Atmosphère) and the Homebrew Menu. It won't run on an unmodified console.
+- Built with libnx 4.12.0.
+
 ## Screens
 
 - **Games**: every game you've played, ranked, with icon, total time, launches, last played and a bar.
