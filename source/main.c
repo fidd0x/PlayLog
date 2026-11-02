@@ -14,7 +14,7 @@
 #include <SDL_ttf.h>
 #include <SDL_image.h>
 
-#define APP_VER "1.2.0"
+#define APP_VER "1.3.0"
 
 #define SCREEN_W 1280
 #define SCREEN_H 720
