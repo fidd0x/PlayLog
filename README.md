@@ -35,7 +35,8 @@ including games you've since deleted.
 - `ZL`/`ZR` switches user profile, `X` exports a CSV to `sdmc:/switch/PlayLog/`, `−` saves a screenshot there, `+` exits.
 - Touch works too: tap to select, tap again to open, drag to scroll.
 
-Totals, launches and first/last dates are the console's official numbers. Daily, session and hour
+Totals, launches and first/last dates are the console's official numbers (forwarders, which usually skip
+user selection, get theirs counted from the event log instead). Daily, session and hour
 breakdowns are rebuilt from the event log, so they can be slightly lower than the totals.
 
 ## Build (Linux, one-time setup)
