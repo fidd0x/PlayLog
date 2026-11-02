@@ -81,11 +81,13 @@ typedef struct {
     Seg *seg;
     int nSeg, capSeg;
     u64 tracked;
+    u32 evLaunches; // launches seen in the event log (fallback when pdm has no totals)
 } Game;
 
 typedef struct {
     AccountUid uid;
     char nick[0x21];
+    SDL_Texture *avatar;
 } User;
 
 static SDL_Window *g_win;
@@ -439,6 +441,13 @@ static void loadUsers(void) {
             AccountProfileBase base;
             if (R_SUCCEEDED(accountProfileGet(&p, &ud, &base)))
                 snprintf(u->nick, sizeof(u->nick), "%.*s", (int)sizeof(base.nickname), base.nickname);
+            u32 isz = 0;
+            if (R_SUCCEEDED(accountProfileGetImageSize(&p, &isz)) && isz > 0) {
+                void *buf = malloc(isz);
+                u32 real = 0;
+                if (buf && R_SUCCEEDED(accountProfileLoadImage(&p, buf, isz, &real))) u->avatar = loadJpeg(buf, real);
+                free(buf);
+            }
             accountProfileClose(&p);
         }
         if (!u->nick[0]) snprintf(u->nick, sizeof(u->nick), "User %d", i + 1);
@@ -461,11 +470,12 @@ static bool uidMatch(const u32 *w, AccountUid id) {
 }
 
 typedef struct {
-    bool active, user;
+    bool active, user, launched;
     u64 app, start;
 } Run;
 
 static void endRun(Run *r, u64 ts) {
+    if (r->active && r->user && r->launched) addGame(r->app)->evLaunches++;
     if (r->active && r->user && ts > r->start && ts - r->start < MAX_SEG_SEC) addSeg(addGame(r->app), r->start, (u32)(ts - r->start));
     r->active = false;
 }
@@ -499,7 +509,9 @@ static void processEvents(AccountUid uid) {
                         run.app = app;
                         run.start = ts;
                         run.user = single || userOpen;
+                        run.launched = false;
                     }
+                    if (e->event_data.applet.event_type == PdmAppletEventType_Launch) run.launched = true;
                     break;
                 case PdmAppletEventType_OutOfFocus:
                 case PdmAppletEventType_OutOfFocus4:
@@ -668,6 +680,7 @@ static void loadUser(int ui) {
         g->first = g->last = 0;
         g->nSeg = 0;
         g->tracked = 0;
+        g->evLaunches = 0;
     }
 
     u64 ids[256];
@@ -689,6 +702,8 @@ static void loadUser(int ui) {
             g->first = st.first_timestamp_user;
             g->last = st.last_timestamp_user;
         }
+        // Forwarders usually don't ask who's playing, so pdm keeps no per-user totals for them
+        if (!g->launches) g->launches = g->evLaunches;
     }
 
     buildView();
@@ -917,6 +932,13 @@ static void drawHeader(void) {
     int w2 = text(F_LARGE, 560, 20, act ? C_TEXT : C_DIM, AL_LEFT, 0, "Activity");
     if (act) fillRect(560, 62, w2, 4, C_ACCENT);
     else fillRect(420, 62, w1, 4, C_ACCENT);
+
+    if (g_nUsers > 0) {
+        User *u = &g_users[g_curUser];
+        if (u->avatar) drawTex(u->avatar, SCREEN_W - 40 - 48, 12, 48, 48);
+        else fillRect(SCREEN_W - 40 - 48, 12, 48, 48, C_FAINT);
+        text(F_BODY, SCREEN_W - 40 - 48 - 14, 22, C_TEXT, AL_RIGHT, 300, "%s", u->nick);
+    }
 }
 
 static void drawFooter(const char *hints) {
@@ -1498,6 +1520,8 @@ cleanup:
     }
     free(g_games);
     free(g_view);
+    for (int i = 0; i < g_nUsers; i++)
+        if (g_users[i].avatar) SDL_DestroyTexture(g_users[i].avatar);
     free(g_daySec);
     free(g_detDaily);
     free(g_detSess);
