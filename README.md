@@ -14,10 +14,12 @@ including games you've since deleted.
 - **Game details** (`A`): total time, launches, average per launch, longest session, days played,
   average per day played, first/last played, a 30-day daily chart (`Left`/`Right` shifts by 30 days),
   and recent sessions. `Up`/`Down` jumps to the previous/next game.
-- **Activity** (`L`/`R`): total time played, today, last 7 / 30 days, daily average, play streak, a two-week chart with a
-  day cursor (`Left`/`Right` one day, `Up`/`Down` one week, `Y` back to today), what you played that day,
-  and an hour-of-day chart.
-- `ZL`/`ZR` switches user profile, `X` exports a CSV to `sdmc:/switch/PlayLog/`, `+` exits.
+- **Activity** (`L`/`R`): today, last 7 / 30 days, daily average and play streak, plus a chart you can browse
+  by **day, week or month** (`A` switches). `Left`/`Right` steps back and forward through previous periods,
+  `Up`/`Down` jumps a whole chart, `Y` returns to now. The selected period shows its total, average per day,
+  change vs the previous period and your top games, next to an hour-of-day chart.
+- Only official games are counted: homebrew forwarders and unknown titles are left out.
+- `ZL`/`ZR` switches user profile, `X` exports a CSV to `sdmc:/switch/PlayLog/`, `−` saves a screenshot there, `+` exits.
 - Touch works too: tap to select, tap again to open, drag to scroll.
 
 Totals, launches and first/last dates are the console's official numbers. Daily, session and hour

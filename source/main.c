@@ -14,7 +14,7 @@
 #include <SDL_ttf.h>
 #include <SDL_image.h>
 
-#define APP_VER "1.0.0"
+#define APP_VER "1.1.0"
 
 #define SCREEN_W 1280
 #define SCREEN_H 720
@@ -29,7 +29,7 @@
 #define LIST_VISIBLE ((SCREEN_H - FOOTER_H - LIST_Y) / ROW_H)
 
 #define DETAIL_DAYS 30
-#define ACT_DAYS 14
+#define ACT_MAX_BARS 14
 
 // Colors are 0xRRGGBBAA
 #define C_BG       0x14161BFF
@@ -52,6 +52,8 @@ enum { SORT_TIME, SORT_RECENT, SORT_LAUNCHES, SORT_FIRST, SORT_NAME, SORT_COUNT 
 static const char *kSortNames[SORT_COUNT] = {"Play time", "Recently played", "Launches", "First played", "Title"};
 
 static const char *kMonths[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+static const char *kMonthsFull[12] = {"January", "February", "March", "April", "May", "June",
+                                      "July", "August", "September", "October", "November", "December"};
 static const char *kWeekdays[7] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 static const char *kWd3[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
@@ -63,6 +65,8 @@ typedef struct {
 typedef struct {
     u64 id;
     bool meta;
+    bool known;  // control data found (an installed or cached official title)
+    bool hidden; // homebrew / forwarder / unknown: excluded from all stats
     char name[0x201];
     char author[0x101];
     SDL_Texture *icon;
@@ -82,7 +86,6 @@ typedef struct {
 typedef struct {
     AccountUid uid;
     char nick[0x21];
-    SDL_Texture *avatar;
 } User;
 
 static SDL_Window *g_win;
@@ -125,11 +128,15 @@ static int g_detDaysPlayed;
 static s64 g_detEnd;
 
 // Activity screen state
-static s64 g_actEnd, g_actSel;
+enum { PER_DAY, PER_WEEK, PER_MONTH, PER_COUNT };
+static const char *kPerNames[PER_COUNT] = {"Day", "Week", "Month"};
+static const int kPerBars[PER_COUNT] = {14, 12, 12};
+static int g_actMode = PER_DAY;
+static int g_actOff, g_actWin; // selected / newest shown period, counted in periods ago
 static Game *g_dayGames[5];
 static u32 g_dayGameSec[5];
 static int g_nDayGames;
-static s64 g_dayGamesFor = -1;
+static s64 g_dayGamesD0 = -1, g_dayGamesD1 = -1;
 
 static char g_toast[160];
 static u64 g_toastUntil;
@@ -395,6 +402,7 @@ static void ensureMeta(Game *g) {
     if (R_FAILED(rc))
         rc = nsGetApplicationControlData(NsApplicationControlSource_CacheOnly, g->id, g_ctrl, sizeof(*g_ctrl), &sz);
     if (R_SUCCEEDED(rc)) {
+        g->known = true;
         NacpLanguageEntry *le = NULL;
         if (R_SUCCEEDED(nacpGetLanguageEntry(&g_ctrl->nacp, &le)) && le) {
             snprintf(g->name, sizeof(g->name), "%.*s", (int)sizeof(le->name), le->name);
@@ -431,13 +439,6 @@ static void loadUsers(void) {
             AccountProfileBase base;
             if (R_SUCCEEDED(accountProfileGet(&p, &ud, &base)))
                 snprintf(u->nick, sizeof(u->nick), "%.*s", (int)sizeof(base.nickname), base.nickname);
-            u32 isz = 0;
-            if (R_SUCCEEDED(accountProfileGetImageSize(&p, &isz)) && isz > 0) {
-                void *buf = malloc(isz);
-                u32 real = 0;
-                if (buf && R_SUCCEEDED(accountProfileLoadImage(&p, buf, isz, &real))) u->avatar = loadJpeg(buf, real);
-                free(buf);
-            }
             accountProfileClose(&p);
         }
         if (!u->nick[0]) snprintf(u->nick, sizeof(u->nick), "User %d", i + 1);
@@ -558,7 +559,7 @@ static void addHourCb(s64 hour, u32 sec, void *ctx) {
 static void buildAggregates(void) {
     s64 minDay = g_today;
     for (int i = 0; i < g_nGames; i++)
-        if (g_games[i]->nSeg) {
+        if (g_games[i]->nSeg && !g_games[i]->hidden) {
             s64 d = localDay(g_games[i]->seg[0].start);
             if (d < minDay) minDay = d;
         }
@@ -572,6 +573,7 @@ static void buildAggregates(void) {
     g_totalTracked = 0;
     for (int i = 0; i < g_nGames; i++) {
         Game *g = g_games[i];
+        if (g->hidden) continue;
         for (int k = 0; k < g->nSeg; k++) {
             splitLocal(g->seg[k].start, g->seg[k].dur, 86400, addDayCb, NULL);
             splitLocal(g->seg[k].start, g->seg[k].dur, 3600, addHourCb, NULL);
@@ -636,27 +638,36 @@ static void loadUser(int ui) {
         }
     }
 
-    buildAggregates();
-
     free(g_view);
     g_view = malloc(sizeof(Game *) * (size_t)(g_nGames > 0 ? g_nGames : 1));
     g_nView = 0;
+    int nPlayed = 0;
     for (int i = 0; i < g_nGames; i++)
-        if (g_games[i]->hasStats || g_games[i]->nSeg) g_view[g_nView++] = g_games[i];
-
-    for (int i = 0; i < g_nView; i++) {
-        if (!g_view[i]->meta && (i % 8) == 0) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Loading titles... %d / %d", i + 1, g_nView);
-            drawLoading(msg);
+        if (g_games[i]->hasStats || g_games[i]->nSeg) nPlayed++;
+    for (int i = 0, done = 0; i < g_nGames; i++) {
+        Game *g = g_games[i];
+        if (!g->hasStats && !g->nSeg) continue;
+        // Official titles use 01xxxxxxxxxxxxxx; forwarders and other homebrew don't, or have no control data
+        bool official = (g->id >> 56) == 0x01;
+        if (official) {
+            if (!g->meta && (done % 8) == 0) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Loading titles... %d / %d", done + 1, nPlayed);
+                drawLoading(msg);
+            }
+            ensureMeta(g);
         }
-        ensureMeta(g_view[i]);
+        done++;
+        g->hidden = !official || !g->known;
+        if (!g->hidden) g_view[g_nView++] = g;
     }
+
+    buildAggregates();
     sortView();
 
     g_sel = g_scroll = 0;
-    g_actEnd = g_actSel = g_today;
-    g_dayGamesFor = -1;
+    g_actOff = g_actWin = 0;
+    g_dayGamesD0 = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -699,11 +710,70 @@ static void openDetail(Game *g) {
 // ---------------------------------------------------------------------------
 // Activity screen
 
-static void computeDayGames(s64 day) {
-    if (g_dayGamesFor == day) return;
-    g_dayGamesFor = day;
+// Day range [d0, d1) of the period `off` periods before the current one
+static void periodRange(int mode, int off, s64 *d0, s64 *d1) {
+    if (mode == PER_DAY) {
+        *d0 = g_today - off;
+        *d1 = *d0 + 1;
+    } else if (mode == PER_WEEK) { // weeks start on Monday
+        *d0 = g_today - (weekday(g_today) + 6) % 7 - 7 * (s64)off;
+        *d1 = *d0 + 7;
+    } else {
+        int y, m, d;
+        civilFromDays(g_today, &y, &m, &d);
+        int idx = y * 12 + (m - 1) - off;
+        *d0 = daysFromCivil(idx / 12, idx % 12 + 1, 1);
+        *d1 = daysFromCivil((idx + 1) / 12, (idx + 1) % 12 + 1, 1);
+    }
+}
+
+static u64 rangeSec(s64 d0, s64 d1) {
+    u64 sum = 0;
+    for (s64 d = d0; d < d1; d++) sum += daySec(d);
+    return sum;
+}
+
+static int maxPeriodOff(int mode) {
+    int off = 0;
+    s64 d0, d1;
+    for (;;) {
+        periodRange(mode, off + 1, &d0, &d1);
+        if (d1 <= g_dayBase) return off;
+        off++;
+    }
+}
+
+static void selectPeriod(int off) {
+    int maxOff = maxPeriodOff(g_actMode), bars = kPerBars[g_actMode];
+    if (off > maxOff) off = maxOff;
+    if (off < 0) off = 0;
+    g_actOff = off;
+    if (g_actOff < g_actWin) g_actWin = g_actOff;
+    if (g_actOff > g_actWin + bars - 1) g_actWin = g_actOff - bars + 1;
+}
+
+// Switches day/week/month while keeping the selected date in view
+static void setPeriodMode(int mode) {
+    s64 d0, d1, target;
+    periodRange(g_actMode, g_actOff, &d0, &d1);
+    target = d0;
+    g_actMode = mode;
+    int off = 0;
+    for (;;) {
+        periodRange(mode, off, &d0, &d1);
+        if (d0 <= target) break;
+        off++;
+    }
+    g_actWin = off > kPerBars[mode] / 2 ? off - kPerBars[mode] / 2 : 0;
+    selectPeriod(off);
+}
+
+static void computeRangeGames(s64 day0, s64 day1) {
+    if (g_dayGamesD0 == day0 && g_dayGamesD1 == day1) return;
+    g_dayGamesD0 = day0;
+    g_dayGamesD1 = day1;
     g_nDayGames = 0;
-    s64 d0 = day * 86400 - g_tzoff, d1 = d0 + 86400;
+    s64 d0 = day0 * 86400 - g_tzoff, d1 = day1 * 86400 - g_tzoff;
     for (int i = 0; i < g_nView; i++) {
         Game *g = g_view[i];
         u64 sum = 0;
@@ -740,6 +810,27 @@ static int streakDays(void) {
 
 // ---------------------------------------------------------------------------
 // Export
+
+static bool g_wantShot;
+
+// Saves the frame being drawn (before the toast) as a PNG; the system Capture button is often blocked for homebrew
+static void saveScreenshot(void) {
+    mkdir("sdmc:/switch", 0777);
+    mkdir("sdmc:/switch/PlayLog", 0777);
+    char path[96];
+    for (int i = 1; i < 1000; i++) {
+        snprintf(path, sizeof(path), "sdmc:/switch/PlayLog/screenshot_%03d.png", i);
+        FILE *f = fopen(path, "rb");
+        if (!f) break;
+        fclose(f);
+    }
+    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, SCREEN_W, SCREEN_H, 32, SDL_PIXELFORMAT_ABGR8888);
+    bool ok = s && SDL_RenderReadPixels(R, NULL, SDL_PIXELFORMAT_ABGR8888, s->pixels, s->pitch) == 0 && IMG_SavePNG(s, path) == 0;
+    if (s) SDL_FreeSurface(s);
+    if (ok) snprintf(g_toast, sizeof(g_toast), "Screenshot saved to %s", path + 5);
+    else snprintf(g_toast, sizeof(g_toast), "Screenshot failed: %s", SDL_GetError());
+    g_toastUntil = armGetSystemTick() + armGetSystemTickFreq() * 3;
+}
 
 static void exportCsv(void) {
     mkdir("sdmc:/switch", 0777);
@@ -799,13 +890,6 @@ static void drawHeader(void) {
     int w2 = text(F_LARGE, 560, 20, act ? C_TEXT : C_DIM, AL_LEFT, 0, "Activity");
     if (act) fillRect(560, 62, w2, 4, C_ACCENT);
     else fillRect(420, 62, w1, 4, C_ACCENT);
-
-    if (g_nUsers > 0) {
-        User *u = &g_users[g_curUser];
-        if (u->avatar) drawTex(u->avatar, SCREEN_W - 40 - 48, 12, 48, 48);
-        else fillRect(SCREEN_W - 40 - 48, 12, 48, 48, C_FAINT);
-        text(F_BODY, SCREEN_W - 40 - 48 - 14, 22, C_TEXT, AL_RIGHT, 300, "%s", u->nick);
-    }
 }
 
 static void drawFooter(const char *hints) {
@@ -873,13 +957,14 @@ static void drawGames(void) {
     }
 }
 
-static void drawBarChart(int x, int y, int w, int h, const u32 *vals, int n, int sel, s64 firstDay) {
+typedef char Label[16];
+
+static void drawBarChart(int x, int y, int w, int h, const u32 *vals, int n, int sel, const Label *l1, const Label *l2) {
     u32 maxV = 60;
     for (int i = 0; i < n; i++)
         if (vals[i] > maxV) maxV = vals[i];
     int slot = w / n;
     int barW = slot * 3 / 4;
-    int labelEvery = n > 20 ? 5 : 1;
     fillRect(x, y + h, w, 2, C_FAINT);
     for (int i = 0; i < n; i++) {
         int bx = x + i * slot + (slot - barW) / 2;
@@ -887,17 +972,9 @@ static void drawBarChart(int x, int y, int w, int h, const u32 *vals, int n, int
         if (vals[i] && bh < 3) bh = 3;
         u32 col = i == sel ? C_WARM : (vals[i] ? C_ACCENT : C_FAINT);
         fillRect(bx, y + h - bh, barW, bh, col);
-        s64 day = firstDay + i;
-        if (n <= 20 || (i % labelEvery) == 0 || i == n - 1 || i == sel) {
-            int yy, mm, dd;
-            civilFromDays(day, &yy, &mm, &dd);
-            if (n <= 20) {
-                text(F_SMALL, bx + barW / 2, y + h + 6, i == sel ? C_TEXT : C_DIM, AL_CENTER, 0, "%s", kWd3[weekday(day)]);
-                text(F_SMALL, bx + barW / 2, y + h + 28, i == sel ? C_TEXT : C_DIM, AL_CENTER, 0, "%d/%d", mm, dd);
-            } else {
-                text(F_SMALL, bx + barW / 2, y + h + 6, C_DIM, AL_CENTER, 0, "%d/%d", mm, dd);
-            }
-        }
+        u32 lc = i == sel ? C_TEXT : C_DIM;
+        if (l1 && l1[i][0]) text(F_SMALL, bx + barW / 2, y + h + 6, lc, AL_CENTER, 0, "%s", l1[i]);
+        if (l2 && l2[i][0]) text(F_SMALL, bx + barW / 2, y + h + 28, lc, AL_CENTER, 0, "%s", l2[i]);
     }
     char buf[32];
     fmtDur(buf, sizeof(buf), maxV);
@@ -936,11 +1013,18 @@ static void drawDetail(void) {
     fillRect(px, py, pw, ph, C_CARD);
     s64 first = g_detEnd - DETAIL_DAYS + 1;
     u32 vals[DETAIL_DAYS];
+    Label lbl[DETAIL_DAYS];
     u64 sum = 0;
     for (int i = 0; i < DETAIL_DAYS; i++) {
         s64 idx = first + i - g_dayBase;
         vals[i] = (idx >= 0 && idx < g_nDays) ? g_detDaily[idx] : 0;
         sum += vals[i];
+        lbl[i][0] = 0;
+        if (i % 5 == 0 || i == DETAIL_DAYS - 1) {
+            int yy, mm, dd;
+            civilFromDays(first + i, &yy, &mm, &dd);
+            snprintf(lbl[i], sizeof(Label), "%d/%d", mm, dd);
+        }
     }
     fmtDay(a, sizeof(a), first, false);
     fmtDay(b, sizeof(b), g_detEnd, true);
@@ -948,7 +1032,7 @@ static void drawDetail(void) {
     char sbuf[32];
     fmtDur(sbuf, sizeof(sbuf), sum);
     text(F_SMALL, px + 20, py + 42, C_DIM, AL_LEFT, 0, "%s \xE2\x80\x93 %s  \xC2\xB7  %s", a, b, sbuf);
-    drawBarChart(px + 20, py + 80, pw - 40, ph - 120, vals, DETAIL_DAYS, -1, first);
+    drawBarChart(px + 20, py + 80, pw - 40, ph - 120, vals, DETAIL_DAYS, -1, lbl, NULL);
 
     // Recent sessions
     int sx = 856, sw = SCREEN_W - 40 - sx;
@@ -976,47 +1060,92 @@ static void drawActivity(void) {
         d30 += v;
         if (i < 7) d7 += v;
     }
-    u64 total = 0;
-    for (int i = 0; i < g_nView; i++) total += gameSecs(g_view[i]);
-    int tw = 191, gap = 10, ty = 88;
-    fmtDur(a, sizeof(a), total);
-    drawTile(40, ty, tw, 80, "Total played", a);
+    int tw = 232, gap = 10, ty = 88;
     fmtDur(a, sizeof(a), daySec(g_today));
-    drawTile(40 + (tw + gap), ty, tw, 80, "Today", a);
+    drawTile(40, ty, tw, 80, "Today", a);
     fmtDur(a, sizeof(a), d7);
-    drawTile(40 + (tw + gap) * 2, ty, tw, 80, "Last 7 days", a);
+    drawTile(40 + (tw + gap), ty, tw, 80, "Last 7 days", a);
     fmtDur(a, sizeof(a), d30);
-    drawTile(40 + (tw + gap) * 3, ty, tw, 80, "Last 30 days", a);
+    drawTile(40 + (tw + gap) * 2, ty, tw, 80, "Last 30 days", a);
     fmtDur(a, sizeof(a), d30 / 30);
-    drawTile(40 + (tw + gap) * 4, ty, tw, 80, "Daily avg (30 days)", a);
+    drawTile(40 + (tw + gap) * 3, ty, tw, 80, "Daily average (30 days)", a);
     int st = streakDays();
     snprintf(a, sizeof(a), "%d day%s", st, st == 1 ? "" : "s");
-    drawTile(40 + (tw + gap) * 5, ty, tw, 80, "Current streak", a);
+    drawTile(40 + (tw + gap) * 4, ty, tw, 80, "Current streak", a);
 
-    // Two-week chart with a cursor
+    // Day / week / month chart with a cursor; oldest period on the left
+    static const char *kChartTitles[PER_COUNT] = {"Daily play time", "Weekly play time", "Monthly play time"};
+    static const char *kPerWord[PER_COUNT] = {"day", "week", "month"};
     int px = 40, py = 182, pw = SCREEN_W - 80, ph = 284;
     fillRect(px, py, pw, ph, C_CARD);
-    s64 first = g_actEnd - ACT_DAYS + 1;
-    u32 vals[ACT_DAYS];
-    for (int i = 0; i < ACT_DAYS; i++) vals[i] = daySec(first + i);
-    fmtDay(a, sizeof(a), first, false);
-    fmtDay(b, sizeof(b), g_actEnd, true);
-    text(F_BODY, px + 20, py + 12, C_TEXT, AL_LEFT, 0, "Daily play time");
-    text(F_SMALL, px + 220, py + 16, C_DIM, AL_LEFT, 0, "%s \xE2\x80\x93 %s", a, b);
-    drawBarChart(px + 20, py + 52, pw - 40, ph - 110, vals, ACT_DAYS, (int)(g_actSel - first), first);
+    int n = kPerBars[g_actMode];
+    u32 vals[ACT_MAX_BARS];
+    Label l1[ACT_MAX_BARS], l2[ACT_MAX_BARS];
+    s64 d0, d1;
+    for (int i = 0; i < n; i++) {
+        periodRange(g_actMode, g_actWin + n - 1 - i, &d0, &d1);
+        vals[i] = (u32)rangeSec(d0, d1);
+        int yy, mm, dd;
+        civilFromDays(d0, &yy, &mm, &dd);
+        l2[i][0] = 0;
+        if (g_actMode == PER_DAY) {
+            snprintf(l1[i], sizeof(Label), "%s", kWd3[weekday(d0)]);
+            snprintf(l2[i], sizeof(Label), "%d/%d", mm, dd);
+        } else if (g_actMode == PER_WEEK) {
+            snprintf(l1[i], sizeof(Label), "%d/%d", mm, dd);
+        } else {
+            snprintf(l1[i], sizeof(Label), "%s", kMonths[mm - 1]);
+            if (mm == 1 || i == 0) snprintf(l2[i], sizeof(Label), "%d", yy);
+        }
+    }
+    text(F_BODY, px + 20, py + 12, C_TEXT, AL_LEFT, 0, "%s", kChartTitles[g_actMode]);
+    for (int m = PER_COUNT - 1, rx = px + pw - 20; m >= 0; m--) {
+        rx -= text(F_BODY, rx, py + 12, m == g_actMode ? C_ACCENT : C_DIM, AL_RIGHT, 0, "%s", kPerNames[m]) + 24;
+    }
+    drawBarChart(px + 20, py + 52, pw - 40, ph - 110, vals, n, n - 1 - (g_actOff - g_actWin), l1, l2);
 
-    // Selected day
+    // Selected period
     int dy = py + ph + 12, dh = SCREEN_H - FOOTER_H - 16 - dy;
     int dw = 640;
     fillRect(px, dy, dw, dh, C_CARD);
-    fmtDay(a, sizeof(a), g_actSel, true);
-    fmtDur(b, sizeof(b), daySec(g_actSel));
-    text(F_BODY, px + 20, dy + 10, C_TEXT, AL_LEFT, 0, "%s, %s", kWeekdays[weekday(g_actSel)], a);
+    periodRange(g_actMode, g_actOff, &d0, &d1);
+    u64 cur = rangeSec(d0, d1);
+    if (g_actMode == PER_DAY) {
+        fmtDay(a, sizeof(a), d0, true);
+        text(F_BODY, px + 20, dy + 10, C_TEXT, AL_LEFT, dw - 200, "%s, %s", kWeekdays[weekday(d0)], a);
+    } else if (g_actMode == PER_WEEK) {
+        fmtDay(a, sizeof(a), d0, false);
+        fmtDay(b, sizeof(b), d1 - 1, true);
+        text(F_BODY, px + 20, dy + 10, C_TEXT, AL_LEFT, dw - 200, "Week of %s \xE2\x80\x93 %s", a, b);
+    } else {
+        int yy, mm, dd;
+        civilFromDays(d0, &yy, &mm, &dd);
+        text(F_BODY, px + 20, dy + 10, C_TEXT, AL_LEFT, dw - 200, "%s %d", kMonthsFull[mm - 1], yy);
+    }
+    fmtDur(b, sizeof(b), cur);
     text(F_BODY, px + dw - 20, dy + 10, C_WARM, AL_RIGHT, 0, "%s", b);
-    computeDayGames(g_actSel);
-    if (!g_nDayGames) text(F_SMALL, px + 20, dy + 50, C_DIM, AL_LEFT, 0, "Nothing played this day");
-    for (int k = 0; k < g_nDayGames && k < 4; k++) {
-        int yy = dy + 46 + k * 34;
+
+    // Average per day and change against the period before
+    char info[96] = "";
+    if (g_actMode != PER_DAY) {
+        s64 last = d1 <= g_today + 1 ? d1 : g_today + 1;
+        fmtDur(a, sizeof(a), last > d0 ? cur / (u64)(last - d0) : 0);
+        snprintf(info, sizeof(info), "%s per day", a);
+    }
+    s64 p0, p1;
+    periodRange(g_actMode, g_actOff + 1, &p0, &p1);
+    u64 prev = rangeSec(p0, p1);
+    char cmp[64] = "";
+    if (prev) {
+        long long pct = ((long long)cur - (long long)prev) * 100 / (long long)prev;
+        snprintf(cmp, sizeof(cmp), "%s%lld%% vs previous %s", pct >= 0 ? "+" : "", pct, kPerWord[g_actMode]);
+    }
+    text(F_SMALL, px + 20, dy + 42, C_DIM, AL_LEFT, dw - 40, "%s%s%s", info, info[0] && cmp[0] ? "  \xC2\xB7  " : "", cmp);
+
+    computeRangeGames(d0, d1);
+    if (!g_nDayGames) text(F_SMALL, px + 20, dy + 76, C_DIM, AL_LEFT, 0, "Nothing played in this %s", kPerWord[g_actMode]);
+    for (int k = 0; k < g_nDayGames && k < 3; k++) {
+        int yy = dy + 72 + k * 34;
         drawIcon(g_dayGames[k], px + 20, yy, 28);
         fmtDur(b, sizeof(b), g_dayGameSec[k]);
         text(F_SMALL, px + 58, yy + 2, C_TEXT, AL_LEFT, dw - 200, "%s", g_dayGames[k]->name);
@@ -1071,10 +1200,14 @@ static void render(void) {
         break;
     case SCR_ACTIVITY:
         drawActivity();
-        snprintf(hints, sizeof(hints), "Left/Right Select day    (Y) Today    (X) Export CSV    L/R Tab%s    (+) Exit", users);
+        snprintf(hints, sizeof(hints), "Left/Right Browse    (A) Day/Week/Month    (Y) Now    (X) CSV    L/R Tab%s    (+) Exit", users);
         break;
     }
     drawFooter(hints);
+    if (g_wantShot) {
+        g_wantShot = false;
+        saveScreenshot();
+    }
     drawToast();
     SDL_RenderPresent(R);
 }
@@ -1106,14 +1239,6 @@ static void clampList(void) {
     if (g_scroll < 0) g_scroll = 0;
 }
 
-static void moveActSel(int delta) {
-    s64 s = g_actSel + delta;
-    if (s > g_today) s = g_today;
-    if (s < g_dayBase) s = g_dayBase;
-    g_actSel = s;
-    if (g_actSel > g_actEnd) g_actEnd = g_actSel;
-    if (g_actSel < g_actEnd - ACT_DAYS + 1) g_actEnd = g_actSel + ACT_DAYS - 1;
-}
 
 static void handleTap(int x, int y) {
     if (y < HEADER_H) {
@@ -1129,12 +1254,10 @@ static void handleTap(int x, int y) {
             else g_sel = i;
         }
     } else if (g_screen == SCR_ACTIVITY && y >= 182 && y < 466) {
-        int slot = (SCREEN_W - 120) / ACT_DAYS;
+        int n = kPerBars[g_actMode];
+        int slot = (SCREEN_W - 120) / n;
         int i = (x - 60) / slot;
-        if (i >= 0 && i < ACT_DAYS) {
-            s64 d = g_actEnd - ACT_DAYS + 1 + i;
-            if (d <= g_today) g_actSel = d;
-        }
+        if (x >= 60 && i < n) selectPeriod(g_actWin + n - 1 - i);
     }
 }
 
@@ -1232,6 +1355,7 @@ int main(int argc, char **argv) {
         u64 down = padGetButtonsDown(&pad);
         u64 held = padGetButtons(&pad);
         if (down & HidNpadButton_Plus) break;
+        if (down & HidNpadButton_Minus) g_wantShot = true;
 
         bool up = repeatKey(down, held, HidNpadButton_AnyUp, 0);
         bool dn = repeatKey(down, held, HidNpadButton_AnyDown, 1);
@@ -1244,6 +1368,8 @@ int main(int argc, char **argv) {
         if ((down & (HidNpadButton_ZL | HidNpadButton_ZR)) && g_nUsers > 1 && g_screen != SCR_DETAIL) {
             g_curUser = (g_curUser + ((down & HidNpadButton_ZR) ? 1 : g_nUsers - 1)) % g_nUsers;
             loadUser(g_curUser);
+            snprintf(g_toast, sizeof(g_toast), "User %d of %d", g_curUser + 1, g_nUsers);
+            g_toastUntil = armGetSystemTick() + armGetSystemTickFreq() * 2;
         }
 
         switch (g_screen) {
@@ -1275,11 +1401,14 @@ int main(int argc, char **argv) {
             }
             break;
         case SCR_ACTIVITY:
-            if (lf) moveActSel(-1);
-            if (rt) moveActSel(1);
-            if (up) moveActSel(-7);
-            if (dn) moveActSel(7);
-            if (down & HidNpadButton_Y) g_actSel = g_actEnd = g_today;
+            if (lf) selectPeriod(g_actOff + 1);
+            if (rt) selectPeriod(g_actOff - 1);
+            if (up) selectPeriod(g_actOff + kPerBars[g_actMode]);
+            if (dn) selectPeriod(g_actOff - kPerBars[g_actMode]);
+            if (down & HidNpadButton_A) setPeriodMode((g_actMode + 1) % PER_COUNT);
+            if (down & HidNpadButton_Y) {
+                g_actOff = g_actWin = 0;
+            }
             if (down & HidNpadButton_X) exportCsv();
             if (down & HidNpadButton_B) g_screen = SCR_GAMES;
             break;
@@ -1325,8 +1454,6 @@ cleanup:
     }
     free(g_games);
     free(g_view);
-    for (int i = 0; i < g_nUsers; i++)
-        if (g_users[i].avatar) SDL_DestroyTexture(g_users[i].avatar);
     free(g_daySec);
     free(g_detDaily);
     free(g_detSess);
