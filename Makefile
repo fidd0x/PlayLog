@@ -22,7 +22,7 @@ INCLUDES	:=	include
 
 APP_TITLE	:=	Play Log
 APP_AUTHOR	:=	fidd0x
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.2.0
 ICON		:=	icon.jpg
 
 PKGCONF		:=	$(PORTLIBS)/bin/aarch64-none-elf-pkg-config

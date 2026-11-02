@@ -14,7 +14,7 @@
 #include <SDL_ttf.h>
 #include <SDL_image.h>
 
-#define APP_VER "1.1.0"
+#define APP_VER "1.2.0"
 
 #define SCREEN_W 1280
 #define SCREEN_H 720
@@ -603,6 +603,59 @@ static int cmpGames(const void *pa, const void *pb) {
 
 static void sortView(void) { qsort(g_view, g_nView, sizeof(Game *), cmpGames); }
 
+static bool g_showHb; // show homebrew forwarders and unknown titles
+
+// Picks which played titles are shown and counted, then rebuilds the stats from them
+static void buildView(void) {
+    free(g_view);
+    g_view = malloc(sizeof(Game *) * (size_t)(g_nGames > 0 ? g_nGames : 1));
+    g_nView = 0;
+    int nPlayed = 0;
+    for (int i = 0; i < g_nGames; i++)
+        if (g_games[i]->hasStats || g_games[i]->nSeg) nPlayed++;
+    for (int i = 0, done = 0; i < g_nGames; i++) {
+        Game *g = g_games[i];
+        if (!g->hasStats && !g->nSeg) continue;
+        // Official titles use 01xxxxxxxxxxxxxx; forwarders and other homebrew don't, or have no control data
+        bool official = (g->id >> 56) == 0x01;
+        if (official || g_showHb) {
+            if (!g->meta && (done % 8) == 0) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Loading titles... %d / %d", done + 1, nPlayed);
+                drawLoading(msg);
+            }
+            ensureMeta(g);
+        }
+        done++;
+        g->hidden = !g_showHb && (!official || !g->known);
+        if (!g->hidden) g_view[g_nView++] = g;
+    }
+
+    buildAggregates();
+    sortView();
+}
+
+#define SETTINGS_PATH "sdmc:/switch/PlayLog/settings.ini"
+
+static void loadSettings(void) {
+    FILE *f = fopen(SETTINGS_PATH, "r");
+    if (!f) return;
+    char line[64];
+    int v;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "show_homebrew=%d", &v) == 1) g_showHb = v != 0;
+    fclose(f);
+}
+
+static void saveSettings(void) {
+    mkdir("sdmc:/switch", 0777);
+    mkdir("sdmc:/switch/PlayLog", 0777);
+    FILE *f = fopen(SETTINGS_PATH, "w");
+    if (!f) return;
+    fprintf(f, "show_homebrew=%d\n", g_showHb ? 1 : 0);
+    fclose(f);
+}
+
 static void loadUser(int ui) {
     AccountUid uid = g_users[ui].uid;
     drawLoading("Reading play history...");
@@ -638,33 +691,7 @@ static void loadUser(int ui) {
         }
     }
 
-    free(g_view);
-    g_view = malloc(sizeof(Game *) * (size_t)(g_nGames > 0 ? g_nGames : 1));
-    g_nView = 0;
-    int nPlayed = 0;
-    for (int i = 0; i < g_nGames; i++)
-        if (g_games[i]->hasStats || g_games[i]->nSeg) nPlayed++;
-    for (int i = 0, done = 0; i < g_nGames; i++) {
-        Game *g = g_games[i];
-        if (!g->hasStats && !g->nSeg) continue;
-        // Official titles use 01xxxxxxxxxxxxxx; forwarders and other homebrew don't, or have no control data
-        bool official = (g->id >> 56) == 0x01;
-        if (official) {
-            if (!g->meta && (done % 8) == 0) {
-                char msg[64];
-                snprintf(msg, sizeof(msg), "Loading titles... %d / %d", done + 1, nPlayed);
-                drawLoading(msg);
-            }
-            ensureMeta(g);
-        }
-        done++;
-        g->hidden = !official || !g->known;
-        if (!g->hidden) g_view[g_nView++] = g;
-    }
-
-    buildAggregates();
-    sortView();
-
+    buildView();
     g_sel = g_scroll = 0;
     g_actOff = g_actWin = 0;
     g_dayGamesD0 = -1;
@@ -1192,7 +1219,8 @@ static void render(void) {
     switch (g_screen) {
     case SCR_GAMES:
         drawGames();
-        snprintf(hints, sizeof(hints), "(A) Details    (Y) Sort    (X) Export CSV    L/R Tab%s    (+) Exit", users);
+        snprintf(hints, sizeof(hints), "(A) Details    (Y) Sort    (X) CSV    (R3) NRO: %s    L/R Tab%s    (+) Exit",
+                 g_showHb ? "On" : "Off", users);
         break;
     case SCR_DETAIL:
         drawDetail();
@@ -1343,6 +1371,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    loadSettings();
     loadUser(g_curUser);
 
     PadState pad;
@@ -1369,6 +1398,21 @@ int main(int argc, char **argv) {
             g_curUser = (g_curUser + ((down & HidNpadButton_ZR) ? 1 : g_nUsers - 1)) % g_nUsers;
             loadUser(g_curUser);
             snprintf(g_toast, sizeof(g_toast), "User %d of %d", g_curUser + 1, g_nUsers);
+            g_toastUntil = armGetSystemTick() + armGetSystemTickFreq() * 2;
+        }
+
+        // Stick click toggles homebrew forwarders / unknown titles (Games and Activity)
+        if ((down & (HidNpadButton_StickL | HidNpadButton_StickR)) && g_screen != SCR_DETAIL) {
+            Game *cur = g_nView ? g_view[g_sel] : NULL;
+            g_showHb = !g_showHb;
+            saveSettings();
+            buildView();
+            g_sel = 0;
+            for (int i = 0; i < g_nView; i++)
+                if (g_view[i] == cur) g_sel = i;
+            clampList();
+            g_dayGamesD0 = -1;
+            snprintf(g_toast, sizeof(g_toast), g_showHb ? "Showing homebrew / NRO titles" : "Hiding homebrew / NRO titles");
             g_toastUntil = armGetSystemTick() + armGetSystemTickFreq() * 2;
         }
 

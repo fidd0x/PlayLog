@@ -29,7 +29,9 @@ including games you've since deleted.
   by **day, week or month** (`A` switches). `Left`/`Right` steps back and forward through previous periods,
   `Up`/`Down` jumps a whole chart, `Y` returns to now. The selected period shows its total, average per day,
   change vs the previous period and your top games, next to an hour-of-day chart.
-- Only official games are counted: homebrew forwarders and unknown titles are left out.
+- By default only official games are counted. Click either stick (`R3`) to show or hide homebrew/NRO
+  forwarders and unknown titles; the choice is saved in `sdmc:/switch/PlayLog/settings.ini`.
+  Homebrew launched straight from the Homebrew Menu isn't logged by the system, so it can't be shown.
 - `ZL`/`ZR` switches user profile, `X` exports a CSV to `sdmc:/switch/PlayLog/`, `−` saves a screenshot there, `+` exits.
 - Touch works too: tap to select, tap again to open, drag to scroll.
 
